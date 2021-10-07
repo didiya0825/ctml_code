@@ -1,7 +1,10 @@
 # CTML
-This is the experimental code for ICLR 2022 submission 817 "Clustered Task-Aware Meta-Learning by Learning from Learning Paths".  
+This is our experimental code for ICLR 2022 submission 817 "Clustered Task-Aware Meta-Learning by Learning from Learning Paths".  
+
+
 
 ## Requirements
+
 python 2.*  
 pillow  
 numpy  
@@ -9,7 +12,10 @@ pandas
 scipy  
 tensorflow 1.10+
 
+
+
 ## Few-Shot Image Classification
+
 Navigate to `few_shot_image` directory for few-shot image classification experiments:
 > cd few_shot_image
 
@@ -68,33 +74,30 @@ few_shot_image/data
     └── test_dict.pkl
 ```
 ### Meta-Training
-To train the proposed model and variants on Meta-Dataset under different settings, run the following:
+To train the proposed model and variants , run the following (here we take 5-way 5-shot on Meta-Dataset for example):
 
-| Setting | Method | Command                                 |
-| :---: | :----: | ---------------------------------------- |
-| 5-way 1-shot  |  CTML  | ```python main.py --data meta_dataset --support_size 1 --path_or_feat both``` |
-| 5-way 1-shot  |  CTML-path  | ```python main.py --data meta_dataset --support_size 1 --path_or_feat only_path``` |
-| 5-way 1-shot  |  CTML-feat (ARML)  | ```python main.py --data meta_dataset --support_size 1 --path_or_feat only_feat``` |
-| 5-way 5-shot  |  CTML  | ```python main.py --data meta_dataset --support_size 5 --path_or_feat both``` |
-| 5-way 5-shot |  CTML-path  | ```python main.py --data meta_dataset --support_size 5 --path_or_feat only_path``` |
-| 5-way 5-shot |  CTML-feat (ARML)  | ```python main.py --data meta_dataset --support_size 1 --path_or_feat only_feat``` |
-
+| Method                 | Command                                                      |
+| ---------------------- | ------------------------------------------------------------ |
+| CTML                   | ```python main.py --data meta_dataset --support_size 5 ```   |
+| CTML-feat              | ```python main.py --data meta_dataset --support_size 5 --path_or_feat feat``` |
+| CTML-path              | ```python main.py --data meta_dataset --support_size 5 --path_or_feat path``` |
+| Linear Path Learner    | ```python main.py --data meta_dataset --support_size 5 --path_learner linear``` |
+| FC Path Learner        | ```python main.py --data meta_dataset --support_size 5 --path_learner fc``` |
+| Attention Path Learner | ```python main.py --data meta_dataset --support_size 5 --path_learner attention``` |
 
 ### Meta-Testing
-To evaluate the proposed model and variants on Meta-Dataset under different settings, run the following:
 
-| Setting | Method | Command                                  |
-| :---: | :----: | ---------------------------------------- |
-| 5-way 1-shot  |  CTML  | ```python main.py --data meta_dataset --support_size 1 --path_or_feat both --eval --test_iters 59000 58000 57000``` |
-| 5-way 1-shot  |  CTML-path  | ```python main.py --data meta_dataset --support_size 1 --path_or_feat only_path --eval --test_iters 59000 58000 57000``` |
-| 5-way 1-shot  |  CTML-feat  | ```python main.py --data meta_dataset --support_size 1 --path_or_feat only_feat --eval --test_iters 59000 58000 57000``` |
-| 5-way 5-shot  |  CTML  | ```python main.py --data meta_dataset --support_size 5 --path_or_feat both --eval --test_iters 59000 58000 57000``` |
-| 5-way 5-shot |  CTML-path  | ```python main.py --data meta_dataset --support_size 5 --path_or_feat only_path --eval --test_iters 59000 58000 57000``` |
-| 5-way 5-shot |  CTML-feat  | ```python main.py --data meta_dataset --support_size 1 --path_or_feat only_feat --eval --test_iters 59000 58000 57000``` |
+To evaluate the model, run the following:
+
+| Method        | Commend                                                      |
+| ------------- | ------------------------------------------------------------ |
+| CTML          | ```python main.py --eval --data meta_dataset --support_size 5 --test_iters 59000 58000 57000``` |
+| CTML(approx.) | ```python main.py --eval --data meta_dataset --support_size 5 --use_shortcut_approx true --test_iters 59000 58000 57000``` |
 
 
 
 ## Cold-Start Recommendation
+
 Navigate to `cold_start_recsys` directory for cold-start recommendation experiments:
 > cd cold_start_recsys  
 
@@ -131,7 +134,7 @@ cold_start_recsys/data
 │   ├── test_df.csv
 │   ├── user_dict.pkl  // user info in one-hot/multi-hot
 │   ├── item_dict.pkl  // item info in one-hot/multi-hot
-│   └── user_set_dict.pkl  // record warm and cold user set
+│   └── user_set_dict.pkl  // record warm start and cold start user set
 ├── yelp_dataset
 │   ├── train_df.csv
 │   ├── val_df.csv
@@ -149,17 +152,31 @@ cold_start_recsys/data
 ```
 
 ### Meta-Training & Meta-Testing
-To train the proposed model and variants on MovieLens-1M under different settings, run the following: 
+To train the proposed model and variants , run the following (here we take MovieLens-1M for example):
 
 | Method | Command                                 |
 | :----: | ---------------------------------------- |
-|  CTML  | ```python main.py --data movielens_1m --path_or_feat both``` |
-|  CTML-path | ```python main.py --data movielens_1m --path_or_feat only_path``` |
-|  CTML-feat | ```python main.py --data movielens_1m --path_or_feat only_feat``` |
+|  CTML  | ```python main.py --data movielens_1m``` |
+| CTML-feat | ```python main.py --data movielens_1m --path_or_feat feat``` |
+| CTML-path | ```python main.py --data movielens_1m --path_or_feat path``` |
+| Linear Path Learner | ```python main.py --data movielens_1m --path_learner linear``` |
+| FC Path Learner | ```python main.py --data movielens_1m --path_learner fc``` |
+| Attention Path Learner | ```python main.py --data movielens_1m --path_learner attention``` |
 
-Meta-testing will be automatically performed after every epoch of meta-training.
+To test the effect of changing the number of clusters, run the following:
+
+| Method         | Command                                                      |
+| -------------- | ------------------------------------------------------------ |
+| Set $k_{path}$ | ```python main.py --data movielens_1m --path_num_cluster 16``` |
+| Set $k_{feat}$ | ```python main.py --data movielens_1m --feat_num_cluster 8``` |
+
+Meta-testing will be automatically performed after every epoch of meta-training. 
+
+Note that if shortcut tunnel is applied, meta-testing with and without the shortcut approximation will both be conducted (i.e., the results of CTML and CTML(approx.) will be displayed together).
 
 
 
-This code is modified based on [ARML](https://github.com/huaxiuyao/ARML) and [MeLU](https://github.com/hoyeoplee/MeLU). We thank the authors for their contributions.
+## Acknowledgement
+
+This code is modified based on [ARML](https://github.com/huaxiuyao/ARML) (for few-shot image classification) and [MeLU](https://github.com/hoyeoplee/MeLU) (for cold-start recommendation). We thank the authors for their contributions.
 
