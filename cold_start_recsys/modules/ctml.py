@@ -4,9 +4,8 @@ from __future__ import division
 import numpy as np
 import tensorflow as tf
 
-from utils import mse, mae
-from task_embedding import Kmeans, PathLearner
-from feature_extractor import FeatEmbedding
+from utils import mse, mae, js_divergence
+from task_rep import Kmeans, PathLearner, FeatExtractor
 
 
 class CTML:
@@ -16,12 +15,15 @@ class CTML:
         self.adapt_lr = config['adapt_lr']
         self.meta_lr = tf.placeholder_with_default(config['meta_lr'], ())
 
-        self.feat_embed = FeatEmbedding(config)
+        self.feat_embed = FeatExtractor(config)
         self.path_learner = PathLearner(config)
         self.kmeans = Kmeans(config)
+        if config['recon_loss_func'] == 'js_div':
+            self.recon_loss_func = js_divergence
+        else:  # config['recon_loss_func'] == 'mse'
+            self.recon_loss_func = mse
 
         self.loss_func = mse
-        self.forward = self.forward
         self.weights = self.construct_weights()
 
         # a: train data for inner gradient, b: test data for meta gradient
@@ -39,51 +41,78 @@ class CTML:
         self.labelb = tf.placeholder(tf.float32, shape=(None, None, 1))
 
         self.mean_meta_loss = None
+        self.shortcut_loss = None
         self.metatrain_op = None
         self.eval_meta_loss = None
         self.eval_mae = None
+        self.eval_meta_loss_approx = None
+        self.eval_mae_approx = None
 
-    def task_metalearn(self, inp):
+    def task_metalearn(self, inp, use_shortcut_approx=False):
         """
         Perform gradient descent for one task in the meta-batch.
         :param inp: (inputa[i], inputb[i], labela[i], labelb[i]) each of shape [a_size, 10246 or 1] or [update_batch_size_eval, 10246 or 1]
+        :param use_shortcut_approx: whether use shortcut approximation for inference
         :return: outputs and losses
         """
         inputa, labela, inputb, labelb = inp
 
-        with tf.variable_scope('task_embedding', reuse=tf.AUTO_REUSE):
-            emb_w = {}
-            for k, v in self.weights.items():
-                if 'emb' in k:
-                    emb_w[k] = tf.stop_gradient(v)
-            feat_embed_vec = self.feat_embed.model(inputa, labela, emb_w)  # [1, feat_embed_dim]
-            path_embed_vec, stacked_vec_ls = self.path_learner.model(inputa, labela, self.forward, self.weights, self.loss_func)  # [1, path_embed_dim]
+        # extract feature embedding
+        emb_w = {}
+        for k, v in self.weights.items():
+            if 'emb' in k:
+                emb_w[k] = tf.stop_gradient(v)
+        feat_emb = self.feat_embed.model(inputa, labela, emb_w)  # [1, embed_dim]
 
-        with tf.variable_scope('task_clustering', reuse=tf.AUTO_REUSE):
-            feat_soft_assignment, feat_embed_vec_kmeans = self.kmeans.feat_model(feat_embed_vec)  # [1, feat_num_cluster], [1, feat_embed_dim]
-            path_soft_assignment, path_embed_vec_kmeans = self.kmeans.path_model(path_embed_vec)  # [1, path_num_cluster], [1, path_embed_dim]
+        # extract path embedding
+        path_emb = self.path_learner.model(inputa, labela, self.forward, self.weights, self.loss_func)  # [1, embed_dim]
 
-            feat_enhanced_emb_vec = tf.concat([feat_embed_vec, feat_embed_vec_kmeans], axis=1)  # [1, feat_embed_dim x 2]
-            path_enhanced_emb_vec = tf.concat([path_embed_vec, path_embed_vec_kmeans], axis=1)  # [1, path_embed_dim x 2]
+        # clustering
+        feat_assignment, clustered_feat_embed = self.kmeans.feat_model(feat_emb)  # [1, feat_num_cluster], [1, embed_dim]
+        path_assignment, clustered_path_embed = self.kmeans.path_model(path_emb)  # [1, path_num_cluster], [1, embed_dim]
 
+        # shortcut tunnel
+        with tf.variable_scope('shortcut_tunnel', reuse=tf.AUTO_REUSE):
+            if self.config['shortcut']:
+                recon_path_assignment = feat_assignment
+                for i in range(1, self.config['shortcut_num_layer']):
+                    recon_path_assignment = tf.layers.dense(recon_path_assignment,
+                                                            units=self.config['path_num_cluster'],
+                                                            use_bias=False,
+                                                            activation=tf.nn.relu,
+                                                            name='mapping_{}'.format(i))  # [1, path_num_cluster]
+                recon_path_assignment = tf.layers.dense(recon_path_assignment,
+                                                        units=self.config['path_num_cluster'],
+                                                        use_bias=False,
+                                                        activation=tf.nn.softmax,
+                                                        name='mapping_{}'.format(
+                                                            self.config['shortcut_num_layer']))  # [1, path_num_cluster]
+                recon_loss = self.recon_loss_func(path_assignment, recon_path_assignment)  # scalar
+
+            if use_shortcut_approx:
+                path_assignment = recon_path_assignment  # [1, path_num_cluster]
+                clustered_path_embed = self.kmeans.path_model_shortcut(path_assignment)  # [1, embed_dim]
+
+        # aggregate
+        with tf.variable_scope('aggregation_weight', reuse=tf.AUTO_REUSE):
             path_feat_probe = tf.nn.sigmoid(
-                tf.get_variable(name='path_feat_probe', shape=feat_enhanced_emb_vec.get_shape().as_list(),  # [1, embed_dim x 2]
+                tf.get_variable(name='lambda', shape=clustered_feat_embed.get_shape().as_list(),
                                 initializer=tf.constant_initializer(0)))
+        if self.config['path_or_feat'] == 'path':
+            task_embed = clustered_path_embed  # [1, embed_dim]
+        elif self.config['path_or_feat'] == 'feat':
+            task_embed = clustered_feat_embed  # [1, embed_dim]
+        else:  # self.config['path_or_feat'] == 'path_and_feat'
+            task_embed = path_feat_probe * clustered_path_embed + (1 - path_feat_probe) * clustered_feat_embed  # [1, embed_dim]
 
-            if self.config['path_or_feat'] == 'only_path':
-                enhanced_emb_vec = path_enhanced_emb_vec
-            elif self.config['path_or_feat'] == 'only_feat':
-                enhanced_emb_vec = feat_enhanced_emb_vec
-            else:  # self.config['path_or_feat'] == 'both'
-                enhanced_emb_vec = path_feat_probe * path_enhanced_emb_vec + (1 - path_feat_probe) * feat_enhanced_emb_vec  # [1, embed_dim x 2]
-
-        with tf.variable_scope('task_specific_mapping', reuse=tf.AUTO_REUSE):
+        # task-aware modulation
+        with tf.variable_scope('task_aware_modulation', reuse=tf.AUTO_REUSE):
             eta = []
             gated_weight_keys = [k for k in self.weights.keys() if 'fcn' in k]
             for key in gated_weight_keys:
                 weight_size = np.prod(self.weights[key].get_shape().as_list())
                 eta.append(tf.reshape(
-                    tf.layers.dense(enhanced_emb_vec, weight_size, activation=tf.nn.sigmoid, name='eta_{}'.format(key)), tf.shape(self.weights[key])))
+                    tf.layers.dense(task_embed, weight_size, activation=tf.nn.sigmoid, name='eta_{}'.format(key)), tf.shape(self.weights[key])))
             eta = dict(zip(gated_weight_keys, eta))
 
             gated_weights = {}
@@ -115,11 +144,14 @@ class CTML:
         task_mae = mae(task_outputb, labelb)
         # task_ndcg20 = nDCG(task_outputb, labelb, topk=20)
 
-        return task_lossb, task_mae
+        if self.config['shortcut']:
+            return task_lossb, task_mae, recon_loss
+        else:
+            return task_lossb, task_mae
 
     def construct_model(self):
 
-        lossb_ls = []
+        lossb_ls, shortcut_loss_ls = [], []
 
         for i in range(self.config['meta_batch_size']):
             a_size = self.a_size[i]
@@ -130,12 +162,18 @@ class CTML:
             task_labelb = self.labelb[i][:b_size]
             result = self.task_metalearn([task_inputa, task_labela, task_inputb, task_labelb])
             lossb_ls.append(result[0])
+            if self.config['shortcut']:
+                shortcut_loss_ls.append(result[-1])
 
         # metatrain_op
         self.mean_meta_loss = tf.reduce_sum(lossb_ls) / self.config['meta_batch_size']  # scalar
+        overall_loss = self.mean_meta_loss
+        if self.config['shortcut']:
+            self.shortcut_loss = tf.reduce_sum(shortcut_loss_ls) / self.config['meta_batch_size']  # scalar
+            overall_loss += self.config['recon_loss_weight'] * self.shortcut_loss
         optimizer = tf.train.AdamOptimizer(self.meta_lr)
         # compute gradients of global theta_0, path learner, clustering network, and task-aware modulation
-        gvs = optimizer.compute_gradients(self.mean_meta_loss)
+        gvs = optimizer.compute_gradients(overall_loss)
         self.metatrain_op = optimizer.apply_gradients(gvs)
 
         # eval
@@ -143,9 +181,12 @@ class CTML:
         task_labela = self.labela[0]
         task_inputb = self.inputb[0]
         task_labelb = self.labelb[0]
-        result = self.task_metalearn([task_inputa, task_labela, task_inputb, task_labelb])
-        self.eval_meta_loss = result[0]
-        self.eval_mae = result[1]
+        outputs = self.task_metalearn([task_inputa, task_labela, task_inputb, task_labelb])
+        outputs_approx = self.task_metalearn([task_inputa, task_labela, task_inputb, task_labelb], use_shortcut_approx=True)
+        self.eval_meta_loss = outputs[0]
+        self.eval_mae = outputs[1]
+        self.eval_meta_loss_approx = outputs_approx[0]
+        self.eval_mae_approx = outputs_approx[1]
 
     def construct_weights(self):
         """
@@ -153,68 +194,69 @@ class CTML:
         profile embedding layers [num, base_embed_dim] & MLP layers [fcn1_hidden_dim, fcn2_hidden_dim]
         :return: weights dict {'rate_emb_w': tf.Variable, 'fcn1/kernel': tf.Variable, ...}
         """
-        if self.config['data'] == 'movielens_1m':
-            weights = {
-                # create item profile emb_w
-                'item_emb_w': tf.get_variable("item_emb_w", [self.config['num_item'], self.config['base_embed_dim']]),
-                'rate_emb_w': tf.get_variable("rate_emb_w", [self.config['num_rate'], self.config['base_embed_dim']]),
-                'genre_emb_w': tf.get_variable("genre_emb_w", [self.config['num_genre'], self.config['base_embed_dim']]),
-                'director_emb_w': tf.get_variable("director_emb_w", [self.config['num_director'], self.config['base_embed_dim']]),
-                'actor_emb_w': tf.get_variable("actor_emb_w", [self.config['num_actor'], self.config['base_embed_dim']]),
+        with tf.variable_scope('base_learner', reuse=tf.AUTO_REUSE):
+            if self.config['data'] == 'movielens_1m':
+                weights = {
+                    # create item profile emb_w
+                    'item_emb_w': tf.get_variable("item_emb_w", [self.config['num_item'], self.config['base_embed_dim']]),
+                    'rate_emb_w': tf.get_variable("rate_emb_w", [self.config['num_rate'], self.config['base_embed_dim']]),
+                    'genre_emb_w': tf.get_variable("genre_emb_w", [self.config['num_genre'], self.config['base_embed_dim']]),
+                    'director_emb_w': tf.get_variable("director_emb_w", [self.config['num_director'], self.config['base_embed_dim']]),
+                    'actor_emb_w': tf.get_variable("actor_emb_w", [self.config['num_actor'], self.config['base_embed_dim']]),
 
-                # create user profile emb_w
-                'user_emb_w': tf.get_variable("user_emb_w", [self.config['num_user'], self.config['base_embed_dim']]),
-                'gender_emb_w': tf.get_variable("gender_emb_w", [self.config['num_gender'], self.config['base_embed_dim']]),
-                'age_emb_w': tf.get_variable("age_emb_w", [self.config['num_age'], self.config['base_embed_dim']]),
-                'occupation_emb_w': tf.get_variable("occupation_emb_w", [self.config['num_occupation'], self.config['base_embed_dim']]),
-                'zipcode_emb_w': tf.get_variable("zipcode_emb_w", [self.config['num_zipcode'], self.config['base_embed_dim']]),
+                    # create user profile emb_w
+                    'user_emb_w': tf.get_variable("user_emb_w", [self.config['num_user'], self.config['base_embed_dim']]),
+                    'gender_emb_w': tf.get_variable("gender_emb_w", [self.config['num_gender'], self.config['base_embed_dim']]),
+                    'age_emb_w': tf.get_variable("age_emb_w", [self.config['num_age'], self.config['base_embed_dim']]),
+                    'occupation_emb_w': tf.get_variable("occupation_emb_w", [self.config['num_occupation'], self.config['base_embed_dim']]),
+                    'zipcode_emb_w': tf.get_variable("zipcode_emb_w", [self.config['num_zipcode'], self.config['base_embed_dim']]),
 
-                # create mlp
-                'fcn1/kernel': tf.get_variable(name='fcn1/kernel', shape=[self.config['base_embed_dim'] * 10, self.config['fcn1_hidden_dim']]),
-                'fcn1/bias': tf.get_variable(name='fcn1/bias', shape=[self.config['fcn1_hidden_dim']]),
-                'fcn2/kernel': tf.get_variable(name='fcn2/kernel', shape=[self.config['fcn1_hidden_dim'], self.config['fcn2_hidden_dim']]),
-                'fcn2/bias': tf.get_variable(name='fcn2/bias', shape=[self.config['fcn2_hidden_dim']]),
-                'fcn3/kernel': tf.get_variable(name='fcn3/kernel', shape=[self.config['fcn2_hidden_dim'], 1]),
-                'fcn3/bias': tf.get_variable(name='fcn3/bias', shape=[1])
-            }
+                    # create mlp
+                    'fcn1/kernel': tf.get_variable(name='fcn1/kernel', shape=[self.config['base_embed_dim'] * 10, self.config['fcn1_hidden_dim']]),
+                    'fcn1/bias': tf.get_variable(name='fcn1/bias', shape=[self.config['fcn1_hidden_dim']]),
+                    'fcn2/kernel': tf.get_variable(name='fcn2/kernel', shape=[self.config['fcn1_hidden_dim'], self.config['fcn2_hidden_dim']]),
+                    'fcn2/bias': tf.get_variable(name='fcn2/bias', shape=[self.config['fcn2_hidden_dim']]),
+                    'fcn3/kernel': tf.get_variable(name='fcn3/kernel', shape=[self.config['fcn2_hidden_dim'], 1]),
+                    'fcn3/bias': tf.get_variable(name='fcn3/bias', shape=[1])
+                }
 
-        elif self.config['data'] == 'yelp':
-            weights = {
-                # create item profile emb_w
-                'item_emb_w': tf.get_variable("item_emb_w", [self.config['num_item'], self.config['base_embed_dim']]),
-                'city_emb_w': tf.get_variable("city_emb_w", [self.config['num_city'], self.config['base_embed_dim']]),
-                'cate_emb_w': tf.get_variable("cate_emb_w", [self.config['num_cate'], self.config['base_embed_dim']]),
+            elif self.config['data'] == 'yelp':
+                weights = {
+                    # create item profile emb_w
+                    'item_emb_w': tf.get_variable("item_emb_w", [self.config['num_item'], self.config['base_embed_dim']]),
+                    'city_emb_w': tf.get_variable("city_emb_w", [self.config['num_city'], self.config['base_embed_dim']]),
+                    'cate_emb_w': tf.get_variable("cate_emb_w", [self.config['num_cate'], self.config['base_embed_dim']]),
 
-                # create user profile emb_w
-                'user_emb_w': tf.get_variable("user_emb_w", [self.config['num_user'], self.config['base_embed_dim']]),
+                    # create user profile emb_w
+                    'user_emb_w': tf.get_variable("user_emb_w", [self.config['num_user'], self.config['base_embed_dim']]),
 
-                # create mlp
-                'fcn1/kernel': tf.get_variable(name='fcn1/kernel', shape=[self.config['base_embed_dim'] * 4, self.config['fcn1_hidden_dim']]),
-                'fcn1/bias': tf.get_variable(name='fcn1/bias', shape=[self.config['fcn1_hidden_dim']]),
-                'fcn2/kernel': tf.get_variable(name='fcn2/kernel', shape=[self.config['fcn1_hidden_dim'], self.config['fcn2_hidden_dim']]),
-                'fcn2/bias': tf.get_variable(name='fcn2/bias', shape=[self.config['fcn2_hidden_dim']]),
-                'fcn3/kernel': tf.get_variable(name='fcn3/kernel', shape=[self.config['fcn2_hidden_dim'], 1]),
-                'fcn3/bias': tf.get_variable(name='fcn3/bias', shape=[1])
-            }
+                    # create mlp
+                    'fcn1/kernel': tf.get_variable(name='fcn1/kernel', shape=[self.config['base_embed_dim'] * 4, self.config['fcn1_hidden_dim']]),
+                    'fcn1/bias': tf.get_variable(name='fcn1/bias', shape=[self.config['fcn1_hidden_dim']]),
+                    'fcn2/kernel': tf.get_variable(name='fcn2/kernel', shape=[self.config['fcn1_hidden_dim'], self.config['fcn2_hidden_dim']]),
+                    'fcn2/bias': tf.get_variable(name='fcn2/bias', shape=[self.config['fcn2_hidden_dim']]),
+                    'fcn3/kernel': tf.get_variable(name='fcn3/kernel', shape=[self.config['fcn2_hidden_dim'], 1]),
+                    'fcn3/bias': tf.get_variable(name='fcn3/bias', shape=[1])
+                }
 
-        else:
-            weights = {
-                # create item profile emb_w
-                'item_emb_w': tf.get_variable("item_emb_w", [self.config['num_item'], self.config['base_embed_dim']]),
-                'brand_emb_w': tf.get_variable("brand_emb_w", [self.config['num_brand'], self.config['base_embed_dim']]),
-                'cate_emb_w': tf.get_variable("cate_emb_w", [self.config['num_cate'], self.config['base_embed_dim']]),
+            else:
+                weights = {
+                    # create item profile emb_w
+                    'item_emb_w': tf.get_variable("item_emb_w", [self.config['num_item'], self.config['base_embed_dim']]),
+                    'brand_emb_w': tf.get_variable("brand_emb_w", [self.config['num_brand'], self.config['base_embed_dim']]),
+                    'cate_emb_w': tf.get_variable("cate_emb_w", [self.config['num_cate'], self.config['base_embed_dim']]),
 
-                # create user profile emb_w
-                'user_emb_w': tf.get_variable("user_emb_w", [self.config['num_user'], self.config['base_embed_dim']]),
+                    # create user profile emb_w
+                    'user_emb_w': tf.get_variable("user_emb_w", [self.config['num_user'], self.config['base_embed_dim']]),
 
-                # create mlp
-                'fcn1/kernel': tf.get_variable(name='fcn1/kernel', shape=[self.config['base_embed_dim'] * 4, self.config['fcn1_hidden_dim']]),
-                'fcn1/bias': tf.get_variable(name='fcn1/bias', shape=[self.config['fcn1_hidden_dim']]),
-                'fcn2/kernel': tf.get_variable(name='fcn2/kernel', shape=[self.config['fcn1_hidden_dim'], self.config['fcn2_hidden_dim']]),
-                'fcn2/bias': tf.get_variable(name='fcn2/bias', shape=[self.config['fcn2_hidden_dim']]),
-                'fcn3/kernel': tf.get_variable(name='fcn3/kernel', shape=[self.config['fcn2_hidden_dim'], 1]),
-                'fcn3/bias': tf.get_variable(name='fcn3/bias', shape=[1])
-            }
+                    # create mlp
+                    'fcn1/kernel': tf.get_variable(name='fcn1/kernel', shape=[self.config['base_embed_dim'] * 4, self.config['fcn1_hidden_dim']]),
+                    'fcn1/bias': tf.get_variable(name='fcn1/bias', shape=[self.config['fcn1_hidden_dim']]),
+                    'fcn2/kernel': tf.get_variable(name='fcn2/kernel', shape=[self.config['fcn1_hidden_dim'], self.config['fcn2_hidden_dim']]),
+                    'fcn2/bias': tf.get_variable(name='fcn2/bias', shape=[self.config['fcn2_hidden_dim']]),
+                    'fcn3/kernel': tf.get_variable(name='fcn3/kernel', shape=[self.config['fcn2_hidden_dim'], 1]),
+                    'fcn3/bias': tf.get_variable(name='fcn3/bias', shape=[1])
+                }
 
         return weights
 
