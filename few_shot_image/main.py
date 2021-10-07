@@ -281,7 +281,7 @@ if __name__ == "__main__":
 
     # Meta-Testing Setting
     parser.add_argument('--use_shortcut_approx', type=str2bool, default=False, help='if True, use shortcut approximation for meta-testing, '
-                                                                                   'applicable only when shortcut is trained')
+                                                                                    'applicable only when shortcut is trained')
     parser.add_argument('--test_num_step', type=int, default=10, help='number of steps for task adaptation during meta-testing')
     parser.add_argument('--test_dataset', type=int, default=-1, help='the sub_dataset to be tested (for meta_dataset only), '
                                                                      '-1: test all, 0: Bird, 1: Aircraft, 2: Fungi, 3: Flower, 4: Texture, 5: Traffic Sign')
