@@ -90,5 +90,27 @@ def cluster_aux_target(soft_assignments):
     return normalized_soft_assignments
 
 
-def kl_divergence(target, output):
-    return tf.reduce_sum(target * tf.log(target / output))
+def student_t_similarity(inputs, centroids, alpha=1.):
+    """
+    :param inputs: [1, embed_dim]
+    :param centroids: [num_cluster, embed_dim]
+    :param alpha: degrees of freedom, scalar
+    :return: soft assignment [1, num_cluster]
+    """
+    distance = tf.reduce_sum(tf.square(inputs - centroids), axis=-1)  # [num_cluster]
+    distance = tf.pow(1 + distance / alpha, - (alpha + 1.) / 2.)  # [num_cluster]
+    soft_assignment = tf.expand_dims(distance / tf.reduce_sum(distance), axis=0)  # [1, num_cluster]
+    return soft_assignment
+
+
+def kl_divergence(p, q):
+    p = tf.reshape(p, [-1])
+    q = tf.reshape(q, [-1])
+    return tf.reduce_sum(p * tf.log(p / q) / tf.log(2.))
+
+
+def js_divergence(p, q):
+    p = tf.reshape(p, [-1])
+    q = tf.reshape(q, [-1])
+    m = 0.5 * (p + q)
+    return 0.5 * kl_divergence(p, m) + 0.5 * kl_divergence(q, m)
