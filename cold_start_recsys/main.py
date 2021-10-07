@@ -26,8 +26,6 @@ def train(config, model, saver, sess, exp_string, datasets, resume_epoch=1):
 
     start_time = time.time()
 
-    overall_maes, ws_maes, cs_maes = [], [], []  # test mae
-
     for epoch in range(resume_epoch, config['num_epoch'] + 1):
 
         print('Epoch {} start!'.format(epoch))
@@ -39,7 +37,7 @@ def train(config, model, saver, sess, exp_string, datasets, resume_epoch=1):
         assert len(supp_sets) == len(query_sets) == train_set_size
 
         train_meta_loss_ls = []  # for entire epoch
-        print_meta_loss_ls = []  # for every print_interval print
+        print_meta_loss_ls, print_shortcut_loss_ls = [], []  # for every print_interval print
         for i in range(num_batch):
             supp_batch = list(supp_sets[config['meta_batch_size'] * i:min(config['meta_batch_size'] * (i + 1), len(supp_sets))])  # tuple, need to convert to list
             supp_xs = [x[:, :-1] for x in supp_batch]  # [[supp_size, movie_sparse_dim + user_sparse_dim], ...]
@@ -57,20 +55,28 @@ def train(config, model, saver, sess, exp_string, datasets, resume_epoch=1):
             feed_dict = {model.a_size: a_size, model.inputa: inputa, model.labela: labela,
                          model.b_size: b_size, model.inputb: inputb, model.labelb: labelb}
 
-            ops = [model.mean_meta_loss, model.metatrain_op]
+            ops = [model.metatrain_op, model.mean_meta_loss]
+            if config['shortcut']:
+                ops.append(model.shortcut_loss)
             outputs = sess.run(ops, feed_dict)
 
-            print_meta_loss_ls.append(outputs[0])
-            train_meta_loss_ls.append(outputs[0])
+            print_meta_loss_ls.append(outputs[1])
+            train_meta_loss_ls.append(outputs[1])
+            if config['shortcut']:
+                print_shortcut_loss_ls.append(outputs[2])
 
             if i % config['print_interval'] == 0:
                 print_avg_meta_loss = sum(print_meta_loss_ls) / len(print_meta_loss_ls)
-                print('[{}] Batch {}: avg_meta_loss {:.4f}'.format(
+                print_string = '[{}] Batch {}: avg_meta_loss {:.4f}'.format(
                     time.strftime('%H:%M:%S', time.gmtime(time.time() - start_time)),
                     i,
-                    print_avg_meta_loss))
+                    print_avg_meta_loss)
+                if config['shortcut']:
+                    print_avg_shortcut_loss = sum(print_shortcut_loss_ls) / len(print_shortcut_loss_ls)
+                    print_string += ', avg_shortcut_loss {:.4f}'.format(print_avg_shortcut_loss)
+                print(print_string)
                 sys.stdout.flush()
-                print_meta_loss_ls = []
+                print_meta_loss_ls, print_shortcut_loss_ls = [], []
 
         train_avg_meta_loss = sum(train_meta_loss_ls) / len(train_meta_loss_ls)
         print('Epoch {} done! time elapsed {}, avg_meta_loss {:.4f}'.format(
@@ -79,14 +85,14 @@ def train(config, model, saver, sess, exp_string, datasets, resume_epoch=1):
             train_avg_meta_loss))
         sys.stdout.flush()
 
-        maes = []
+        maes, maes_approx = [], []
         for state in ['val_ws', 'val_cs', 'test_ws', 'test_cs']:
 
             eval_set_size = len(datasets[state])  # number of tasks in evaluate set
             supp_sets, query_sets = list(zip(*datasets[state]))  # [(T1_support, T2_support, ...), (T1_query, T2_query, ...)]
             assert len(supp_sets) == len(query_sets) == eval_set_size
 
-            meta_loss_ls, mae_ls = [], []
+            meta_loss_ls, mae_ls, meta_loss_approx_ls, mae_approx_ls = [], [], [], []
             for i in range(eval_set_size):
                 inputa = np.expand_dims(supp_sets[i][:, :-1], 0)  # [1, supp_size, movie_sparse_dim + user_sparse_dim]
                 labela = np.expand_dims(np.expand_dims(supp_sets[i][:, -1], 0), -1)  # [1, supp_size, 1]
@@ -96,19 +102,32 @@ def train(config, model, saver, sess, exp_string, datasets, resume_epoch=1):
                              model.inputb: inputb, model.labelb: labelb}
 
                 ops = [model.eval_meta_loss, model.eval_mae]
+                if config['shortcut']:
+                    ops.extend([model.eval_meta_loss_approx, model.eval_mae_approx])
                 outputs = sess.run(ops, feed_dict)
 
                 meta_loss_ls.append(outputs[0])
                 mae_ls.append(outputs[1])
+                if config['shortcut']:
+                    meta_loss_approx_ls.append(outputs[2])
+                    mae_approx_ls.append(outputs[3])
 
             avg_meta_loss = sum(meta_loss_ls) / len(meta_loss_ls)
             avg_mae = sum(mae_ls) / len(mae_ls)
             maes.append(avg_mae)
-            print('Evaluate {} done! time elapsed {}, avg_meta_loss {:.4f}, avg_mae {:.4f}'.format(
+            print_string = 'Evaluate {} done! time elapsed {}, avg_meta_loss {:.4f}, avg_mae {:.4f}'.format(
                 state,
                 time.strftime('%H:%M:%S', time.gmtime(time.time() - start_time)),
                 avg_meta_loss,
-                avg_mae))
+                avg_mae)
+            if config['shortcut']:
+                avg_meta_loss_approx = sum(meta_loss_approx_ls) / len(meta_loss_approx_ls)
+                avg_mae_approx = sum(mae_approx_ls) / len(mae_approx_ls)
+                maes_approx.append(avg_mae_approx)
+                print_string += ', avg_meta_loss_approx {:.4f}, avg_mae_approx {:.4f}'.format(
+                    avg_meta_loss_approx,
+                    avg_mae_approx)
+            print(print_string)
             sys.stdout.flush()
 
         overall_val_mae = (maes[0] * len(datasets['val_ws']) + maes[1] * len(datasets['val_cs'])) / (
@@ -116,12 +135,16 @@ def train(config, model, saver, sess, exp_string, datasets, resume_epoch=1):
         overall_test_mae = (maes[2] * len(datasets['test_ws']) + maes[3] * len(datasets['test_cs'])) / (
                 len(datasets['test_ws']) + len(datasets['test_cs']))
         print('overall_val_mae {:.4f}, overall_test_mae {:.4f}'.format(overall_val_mae, overall_test_mae))
+
+        if config['shortcut']:
+            overall_val_mae_approx = (maes_approx[0] * len(datasets['val_ws']) + maes_approx[1] * len(datasets['val_cs'])) / (
+                    len(datasets['val_ws']) + len(datasets['val_cs']))
+            overall_test_mae_approx = (maes_approx[2] * len(datasets['test_ws']) + maes_approx[3] * len(datasets['test_cs'])) / (
+                    len(datasets['test_ws']) + len(datasets['test_cs']))
+            print('overall_val_mae_approx {:.4f}, overall_test_mae_approx {:.4f}'.format(overall_val_mae_approx, overall_test_mae_approx))
+
         print('')
         sys.stdout.flush()
-
-        overall_maes.append(overall_test_mae)
-        ws_maes.append(maes[2])
-        cs_maes.append(maes[3])
 
         if epoch % config['save_interval'] == 0:
             ckpt_alias = config['logdir'] + '/' + exp_string + 'Epoch{}_mae{:.4f}_ws{:.4f}_cs{:.4f}'.format(
@@ -225,8 +248,9 @@ def main(args):
     exp_string += '.ss' + str(config['support_size']) + '.mbs' + str(
         config['meta_batch_size']) + '.nstep' + str(config['num_step']) + '.alr' + str(
         config['adapt_lr']) + '.mlr' + str(config['meta_lr']) + '.embed' + str(
-        config['embed_dim']) + '.' + str(config['path_or_feat'])
-    if config['path_or_feat'] in ['both', 'only_path']:
+        config['embed_dim']) + '.' + str(config['similarity_kernel']) + '.' + str(config['path_or_feat'])
+    if 'path' in config['path_or_feat']:
+        exp_string += '.rnstep' + str(config['rehearse_num_step'])
         if config['path_stop_grad']:
             exp_string += '.psg'
         if config['add_param']:
@@ -240,8 +264,16 @@ def main(args):
         exp_string += '.' + str(config['path_learner'])
         if config['path_learner'] == 'gru':
             exp_string += '.ghd' + str(config['gru_hidden_dim']) + '.god' + str(config['gru_output_dim'])
+        elif config['path_learner'] == 'fc':
+            exp_string += '.fnl' + str(config['fc_num_layer'])
+        elif config['path_learner'] == 'attention':
+            exp_string += '.anl' + str(config['att_num_layer']) + '.ahd' + str(config['att_hidden_dim'])
         exp_string += '.pnc' + str(config['path_num_cluster'])
+    if 'feat' in config['path_or_feat']:
         exp_string += '.fnc' + str(config['feat_num_cluster'])
+    if config['shortcut']:
+        exp_string += '.' + str(config['recon_loss_func']) + str(config['recon_loss_weight'])
+        exp_string += '.snl' + str(config['shortcut_num_layer'])
     print(exp_string)
     sys.stdout.flush()
 
@@ -278,7 +310,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Clustered Task-Aware Meta-Learning')
 
     # General Setting
-    parser.add_argument('--data', type=str, default='movielens_1m', help='which dataset to use, movielens_1m, yelp or amazon_cds')
+    parser.add_argument('--data', type=str, default='movielens_1m', help="which dataset to use, "
+                                                                         "'movielens_1m', 'yelp' or 'amazon_cds'")
     parser.add_argument('--datadir', type=str, default='data', help='datasets directory')
     parser.add_argument('--logdir', type=str, default='ckpts', help='log and checkpoints directory')
 
@@ -288,25 +321,38 @@ if __name__ == "__main__":
     parser.add_argument('--fcn2_hidden_dim', type=int, default=16, help='hidden size of the second fully-connected layer')
 
     # Meta-Learner Setting
-    parser.add_argument('--embed_dim', type=int, default=20, help='dimension of path & feature embedding')
-    parser.add_argument('--path_or_feat', type=str, default='both', help='whether to use path or feature for task representation, '
-                                                                         'both, only_path, or only_feat (equivalent to ARML implementation)')
+    parser.add_argument('--stop_grad', type=str2bool, default=True, help='if True, do not use second derivatives in meta-update (for speed)')
+    parser.add_argument('--path_or_feat', type=str, default='path_and_feat', help="whether to use path or feature for task representation, "
+                                                                                  "'path', 'feat' or 'path_and_feat'")
+    # # step-wise components
     parser.add_argument('--path_stop_grad', type=str2bool, default=False, help='if True, treat gradients used in path embedding as constant')
     parser.add_argument('--add_param', type=str2bool, default=True, help='if True, include updated parameters for path modeling')
     parser.add_argument('--add_loss', type=str2bool, default=True, help='if True, include losses for path modeling')
     parser.add_argument('--add_grad', type=str2bool, default=True, help='if True, include gradients for path modeling')
     parser.add_argument('--add_fisher', type=str2bool, default=True, help='if True, include fisher information for path modeling')
-    parser.add_argument('--path_learner', type=str, default='gru', help='design of path learner, gru or linear')
-    parser.add_argument('--gru_hidden_dim', type=int, default=4, help='hidden size for gru path learner')
-    parser.add_argument('--gru_output_dim', type=int, default=1, help='output size for gru path learner')
-    parser.add_argument('--path_num_cluster', type=int, default=8, help='number of clusters for path embedding')
+    # # path learner
+    parser.add_argument('--rehearse_num_step', type=int, default=5, help='number of steps for rehearsed task learning')
+    parser.add_argument('--path_learner', type=str, default='gru', help="design of path learner, 'gru', 'linear', 'fc' or 'attention'")
+    parser.add_argument('--gru_hidden_dim', type=int, default=4, help='only for gru path learner, hidden state dimension')
+    parser.add_argument('--gru_output_dim', type=int, default=1, help='only for gru path learner, output dimension')
+    parser.add_argument('--fc_num_layer', type=int, default=3, help='only for fc path learner, number of layers')
+    parser.add_argument('--att_num_layer', type=int, default=3, help='only for attention path learner, number of layers')
+    parser.add_argument('--att_hidden_dim', type=int, default=4, help='only for attention path learner, attention hidden dimension d_a')
+    # # clustering
+    parser.add_argument('--embed_dim', type=int, default=256, help='dimension of path & feature embedding')
+    parser.add_argument('--similarity_kernel', type=str, default='student_t', help="similarity kernel used to compare with centroids, 'student_t' or 'dot_product'")
+    parser.add_argument('--path_num_cluster', type=int, default=16, help='number of clusters for path embedding')
     parser.add_argument('--feat_num_cluster', type=int, default=8, help='number of clusters for feature embedding')
-    parser.add_argument('--stop_grad', type=str2bool, default=True, help='if True, do not use second derivatives in meta-update (for speed)')
+    # # shortcut tunnel
+    parser.add_argument('--shortcut', type=str2bool, default=True, help='if True, construct and train the shortcut tunnel')
+    parser.add_argument('--recon_loss_func', type=str, default='js_div', help="reconstruction loss function, 'js_div' or 'mse'")
+    parser.add_argument('--recon_loss_weight', type=float, default=1.0, help='reconstruction loss weight')
+    parser.add_argument('--shortcut_num_layer', type=int, default=2, help='number of layers for the shortcut tunnel')
 
     # Meta-Training Setting
     parser.add_argument('--num_step', type=int, default=5, help='number of steps for task adaptation')
     parser.add_argument('--meta_lr', type=float, default=5e-5, help='meta-update learning rate')
-    parser.add_argument('--adapt_lr', type=float, default=5e-6, help='task adaptation learning rate')
+    parser.add_argument('--adapt_lr', type=float, default=5e-3, help='task adaptation learning rate')
     parser.add_argument('--meta_batch_size', type=int, default=1, help='number of tasks sampled per meta-update')
     parser.add_argument('--support_size', type=int, default=10, help='support/training set size for task adaptation (i.e., K-shot), can vary from 0 to 10')
     parser.add_argument('--num_epoch', type=int, default=20, help='number of epochs over entire dataset for meta-training')
