@@ -165,10 +165,10 @@ To train the proposed model and variants , run the following (here we take Movie
 
 To test the effect of changing the number of clusters, run the following:
 
-| Method         | Command                                                      |
-| -------------- | ------------------------------------------------------------ |
-| Set $k_{path}$ | ```python main.py --data movielens_1m --path_num_cluster 16``` |
-| Set $k_{feat}$ | ```python main.py --data movielens_1m --feat_num_cluster 8``` |
+| Method                         | Command                                                      |
+| ------------------------------ | ------------------------------------------------------------ |
+| Set number of path clusters    | ```python main.py --data movielens_1m --path_num_cluster 16``` |
+| Set number of feature clusters | ```python main.py --data movielens_1m --feat_num_cluster 8``` |
 
 Meta-testing will be automatically performed after every epoch of meta-training. 
 
