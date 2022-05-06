@@ -1,5 +1,5 @@
 # CTML
-This is our experimental code for ICLR 2022 submission "Clustered Task-Aware Meta-Learning by Learning from Learning Paths".  
+This is our experimental code for the submission "Clustered Task-Aware Meta-Learning by Learning from Learning Paths".  
 
 
 
