@@ -1,6 +1,0 @@
-pillow
-numpy
-pandas
-scipy
-tensorflow==1.12
-
